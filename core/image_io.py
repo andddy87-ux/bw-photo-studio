@@ -253,11 +253,22 @@ def _load_heif(filepath: Path, metadata: dict) -> tuple[np.ndarray, dict]:
 
 
 def _load_standard(filepath: Path, metadata: dict) -> tuple[np.ndarray, dict]:
-    """Загружает стандартный формат (JPEG, PNG, TIFF, BMP)."""
-    bgr = cv2.imread(str(filepath), cv2.IMREAD_UNCHANGED)
+    """Загружает стандартный формат (JPEG, PNG, TIFF, BMP).
 
+    Использует numpy.fromfile + cv2.imdecode вместо cv2.imread,
+    чтобы корректно работать с кириллическими и Unicode-путями на Windows.
+    """
+    bgr = None
+
+    # --- Метод 1: numpy buffer + imdecode (поддерживает Unicode-пути) ---
+    try:
+        buf = np.fromfile(str(filepath), dtype=np.uint8)
+        bgr = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+    except Exception:
+        bgr = None
+
+    # --- Метод 2: PIL (запасной, также поддерживает Unicode) ---
     if bgr is None:
-        # Запасной вариант через PIL
         if PIL_AVAILABLE:
             pil_img = PILImage.open(str(filepath))
             if pil_img.mode == 'RGBA':
@@ -326,6 +337,10 @@ def save_image(image: np.ndarray, filepath: str, quality: int = 95) -> bool:
     """
     Сохраняет изображение в файл.
 
+    Использует cv2.imencode + запись байт через Python open(),
+    чтобы корректно работать с кириллическими и Unicode-путями на Windows
+    (cv2.imwrite напрямую не поддерживает Unicode-пути на Windows).
+
     Args:
         image: BGR numpy uint8 массив.
         filepath: путь для сохранения.
@@ -338,21 +353,34 @@ def save_image(image: np.ndarray, filepath: str, quality: int = 95) -> bool:
     ext = filepath.suffix.lower()
 
     try:
+        img = np.clip(image, 0, 255).astype(np.uint8)
+
         if ext in {'.jpg', '.jpeg'}:
             params = [cv2.IMWRITE_JPEG_QUALITY, min(100, max(1, quality))]
-            success = cv2.imwrite(str(filepath), image, params)
+            ok, buf = cv2.imencode('.jpg', img, params)
         elif ext == '.png':
             compression = max(0, min(9, 9 - quality // 11))
             params = [cv2.IMWRITE_PNG_COMPRESSION, compression]
-            success = cv2.imwrite(str(filepath), image, params)
+            ok, buf = cv2.imencode('.png', img, params)
         elif ext in {'.tiff', '.tif'}:
-            # Сохраняем без потерь
-            params = [cv2.IMWRITE_TIFF_COMPRESSION, 1]
-            success = cv2.imwrite(str(filepath), image, params)
+            if PIL_AVAILABLE:
+                # PIL лучше поддерживает TIFF и Unicode-пути
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                pil_img = PILImage.fromarray(rgb)
+                pil_img.save(str(filepath), compression='tiff_lzw')
+                return True
+            else:
+                ok, buf = cv2.imencode('.tiff', img)
+        elif ext == '.bmp':
+            ok, buf = cv2.imencode('.bmp', img)
         else:
-            success = cv2.imwrite(str(filepath), image)
+            ok, buf = cv2.imencode(ext if ext else '.png', img)
 
-        return bool(success)
+        if ok:
+            with open(str(filepath), 'wb') as f:
+                f.write(buf.tobytes())
+            return True
+        return False
 
     except Exception as e:
         print(f'Ошибка сохранения файла: {e}')
@@ -396,3 +424,5 @@ def raw_available() -> bool:
 
 def heif_available() -> bool:
     return HEIF_AVAILABLE
+
+
