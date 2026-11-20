@@ -1,0 +1,112 @@
+name: Build Windows EXE
+
+# Запускается:
+#   - при создании тега v* (например v1.0, v1.1)  → создаёт GitHub Release с EXE
+#   - вручную через кнопку «Run workflow» на GitHub
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build EXE (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      # 1. Скачиваем код репозитория
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Устанавливаем Python 3.11 64-bit
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+          cache: 'pip'
+
+      # 3. Обновляем pip и устанавливаем зависимости
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          pip install -r requirements.txt
+          pip install pyinstaller>=6.0
+
+      # 4. Проверяем, что все модули импортируются
+      - name: Verify imports
+        run: |
+          python -c "import cv2; print('cv2 OK')"
+          python -c "import numpy; print('numpy OK')"
+          python -c "import PIL; print('Pillow OK')"
+          python -c "import scipy; print('scipy OK')"
+          python -c "import PyQt5.QtWidgets; print('PyQt5 OK')"
+          python -c "import rawpy; print('rawpy OK')" || echo "rawpy unavailable (optional)"
+          python -c "import pillow_heif; print('pillow_heif OK')" || echo "pillow_heif unavailable (optional)"
+
+      # 5. Сборка .exe через PyInstaller
+      - name: Build with PyInstaller
+        run: pyinstaller build.spec --clean --noconfirm
+
+      # 6. Проверяем, что EXE создан
+      - name: Verify build output
+        run: |
+          if (Test-Path "dist\BW_Photo_Studio\BW_Photo_Studio.exe") {
+            Write-Host "EXE found: OK"
+            Get-Item "dist\BW_Photo_Studio\BW_Photo_Studio.exe" | Select-Object Name, Length
+          } else {
+            Write-Host "ERROR: EXE not found!"
+            exit 1
+          }
+        shell: powershell
+
+      # 7. Упаковываем папку dist в ZIP
+      - name: Create ZIP archive
+        run: |
+          Compress-Archive `
+            -Path "dist\BW_Photo_Studio\*" `
+            -DestinationPath "dist\BW_Photo_Studio_Windows_x64.zip" `
+            -CompressionLevel Optimal
+          Write-Host "ZIP size: $((Get-Item 'dist\BW_Photo_Studio_Windows_x64.zip').Length / 1MB) MB"
+        shell: powershell
+
+      # 8. Сохраняем ZIP как артефакт сборки (доступен 30 дней)
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BW_Photo_Studio_Windows_x64
+          path: dist/BW_Photo_Studio_Windows_x64.zip
+          retention-days: 30
+
+      # 9. При наличии тега — создаём GitHub Release автоматически
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "BW Photo Studio ${{ github.ref_name }}"
+          body: |
+            ## BW Photo Studio ${{ github.ref_name }}
+
+            ### Установка
+            1. Скачайте `BW_Photo_Studio_Windows_x64.zip`
+            2. Распакуйте в любую папку
+            3. Запустите `BW_Photo_Studio.exe`
+
+            > **Python не нужен** — это самодостаточный портативный EXE.
+
+            ### Поддерживаемые форматы
+            - **RAW:** Nikon NEF/NRW, Canon CR2/CR3, Sony ARW, Fujifilm RAF и другие
+            - **JPEG, PNG, TIFF, BMP, WebP**
+            - **HEIF/HEIC** (Nikon Z6 III, iOS)
+
+            ### Алгоритмы
+            - 10+ методов конвертации в Ч/Б (Rec.601, Rec.709, Rec.2100, Lab, Adaptive...)
+            - 6 методов тонирования в сепию
+            - Полный набор инструментов редактирования Ч/Б
+            - Инфракрасная обработка (ИК-фильтры 590/720/850nm, Эффект Вуда и др.)
+          files: dist/BW_Photo_Studio_Windows_x64.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
