@@ -60,8 +60,8 @@ class MainWindow(QMainWindow):
 
         # --- Данные ---
         self._original: np.ndarray | None = None
-        self._working:  np.ndarray | None = None   # Текущее состояние
-        self._processed: np.ndarray | None = None  # Результат последней операции
+        self._working:  np.ndarray | None = None   # Текущее состояние (подтверждённое)
+        self._pending_preview: np.ndarray | None = None  # Предпросмотр (не подтверждён)
         self._metadata: dict = {}
 
         self._undo_stack: list[np.ndarray] = []
@@ -143,6 +143,9 @@ class MainWindow(QMainWindow):
         # Соединяем сигналы viewer
         self._viewer.zoom_changed.connect(self._on_zoom_changed)
         self._viewer.cursor_moved.connect(self._on_cursor_moved)
+
+        # Отменяем предпросмотр при переключении вкладок
+        self._tools_tab.currentChanged.connect(self._on_tab_changed)
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -297,6 +300,7 @@ class MainWindow(QMainWindow):
     def _connect_panels(self):
         for panel in [self._bw_panel, self._sepia_panel,
                       self._edit_panel, self._ir_panel]:
+            panel.preview_ready.connect(self._on_panel_preview)
             panel.result_ready.connect(self._on_panel_result)
 
     # ==================================================================
@@ -333,7 +337,7 @@ class MainWindow(QMainWindow):
 
         self._original = image.copy()
         self._working  = image.copy()
-        self._processed = None
+        self._pending_preview = None
         self._metadata  = meta
         self._undo_stack.clear()
         self._redo_stack.clear()
@@ -389,7 +393,7 @@ class MainWindow(QMainWindow):
 
         self._settings.setValue('last_save_dir', os.path.dirname(filepath))
 
-        img_to_save = self._processed if self._processed is not None else self._working
+        img_to_save = self._working
         ok = save_image(img_to_save, filepath)
 
         if ok:
@@ -428,7 +432,7 @@ class MainWindow(QMainWindow):
             return
         self._redo_stack.append(self._working.copy())
         self._working = self._undo_stack.pop()
-        self._processed = None
+        self._pending_preview = None
         self._update_view()
         self._update_actions()
 
@@ -437,7 +441,7 @@ class MainWindow(QMainWindow):
             return
         self._undo_stack.append(self._working.copy())
         self._working = self._redo_stack.pop()
-        self._processed = None
+        self._pending_preview = None
         self._update_view()
         self._update_actions()
 
@@ -452,37 +456,55 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             self._push_undo(self._working)
             self._working = self._original.copy()
-            self._processed = None
+            self._pending_preview = None
             self._update_view()
 
     # ==================================================================
-    # Результат панели
+    # Предпросмотр и подтверждение изменений
     # ==================================================================
 
-    def _on_panel_result(self, result: np.ndarray):
-        """Получаем обработанное изображение от панели."""
-        self._processed = result
-
-        # Обновляем просмотр
+    def _on_panel_preview(self, result: np.ndarray):
+        """
+        Живой предпросмотр — показываем до/после, но НЕ коммитим в историю undo.
+        Вызывается при любом изменении настроек (с дебаунсом 200 мс).
+        """
+        self._pending_preview = result
         self._viewer.set_original(self._working)
         self._viewer.set_processed(result)
         self._histogram.set_image(result)
-
-        # Обновляем действия
         self._update_actions()
 
-        # Автоматически принимаем результат в рабочий слой,
-        # но оставляем возможность сравнения через viewer
+    def _on_panel_result(self, result: np.ndarray):
+        """
+        Подтверждение — нажата кнопка «Применить».
+        Коммитим изменения в историю undo и обновляем рабочее изображение.
+        """
         self._push_undo(self._working)
         self._working = result.copy()
+        self._pending_preview = None
 
         # Обновляем источник для всех панелей
         for panel in [self._bw_panel, self._sepia_panel,
                       self._edit_panel, self._ir_panel]:
             panel.set_source(self._working)
 
+        # Показываем новое рабочее состояние без разделения до/после
+        self._viewer.set_original(self._working)
+        self._viewer.set_processed(None)
+        self._histogram.set_image(self._working)
+        self._update_actions()
+
+    def _on_tab_changed(self, index: int):
+        """Отменяет предпросмотр при переключении вкладок."""
+        if self._working is not None and self._pending_preview is not None:
+            self._pending_preview = None
+            self._viewer.set_original(self._working)
+            self._viewer.set_processed(None)
+            self._histogram.set_image(self._working)
+
     def _update_view(self):
         """Обновляет просмотр при undo/redo."""
+        self._pending_preview = None
         self._viewer.set_original(self._original)
         self._viewer.set_processed(self._working if self._working is not self._original else None)
         self._histogram.set_image(self._working)
