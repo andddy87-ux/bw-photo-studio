@@ -6,6 +6,10 @@
   SepiaPanel         — тонирование в сепию
   EditingPanel       — редактирование Ч/Б фото
   InfraredPanel      — инфракрасная обработка
+
+Живой предпросмотр:
+  Все панели испускают preview_ready при любом изменении настроек (с дебаунсом 200 мс).
+  Нажатие «Применить» испускает result_ready, что коммитит изменения в историю undo.
 """
 
 import numpy as np
@@ -18,7 +22,7 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox, QSpinBox, QSizePolicy, QColorDialog,
     QStackedWidget
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt5.QtGui import QColor, QPalette
 
 from core.bw_algorithms  import (apply_bw, BW_METHODS, get_method_list,
@@ -136,21 +140,67 @@ def _wrap_scroll(widget: QWidget) -> QScrollArea:
 # ---------------------------------------------------------------------------
 
 class _BasePanel(QWidget):
-    """Базовый класс панели инструментов. Испускает сигнал result_ready."""
+    """
+    Базовый класс панели инструментов.
 
-    result_ready = pyqtSignal(np.ndarray)  # Испускает обработанное изображение
+    Сигналы:
+        preview_ready — испускается при любом изменении настроек (с дебаунсом 200 мс).
+                        Главное окно показывает предпросмотр, но НЕ коммитит в undo.
+        result_ready  — испускается при нажатии «Применить».
+                        Главное окно коммитит изменения в историю undo.
+    """
+
+    preview_ready = pyqtSignal(np.ndarray)  # Живой предпросмотр, без коммита в undo
+    result_ready  = pyqtSignal(np.ndarray)  # Подтверждение, коммит в undo
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._source: np.ndarray | None = None
+        # Дебаунс-таймер: предпросмотр срабатывает через 200 мс после последнего изменения
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(200)
+        self._preview_timer.timeout.connect(self._do_preview)
 
     def set_source(self, image: np.ndarray | None):
-        """Устанавливает исходное изображение (оригинал или текущая рабочая копия)."""
+        """Устанавливает исходное изображение (текущая рабочая копия)."""
         self._source = image
 
-    def _emit_result(self, result: np.ndarray | None):
+    def _schedule_preview(self):
+        """Запускает/перезапускает таймер предпросмотра (вызывать при любом изменении)."""
+        if self._source is not None:
+            self._preview_timer.start()
+
+    def _do_preview(self):
+        """Вызывается по таймеру — вычисляет предпросмотр и испускает preview_ready."""
+        result = self._compute()
+        if result is not None:
+            self.preview_ready.emit(result)
+
+    def _compute(self) -> np.ndarray | None:
+        """Переопределить в подклассе: применяет текущие настройки панели к self._source."""
+        return None
+
+    def _apply(self):
+        """Нажатие «Применить» — коммит в историю undo."""
+        result = self._compute()
         if result is not None:
             self.result_ready.emit(result)
+
+    def _reset(self):
+        """Нажатие «Сброс» — отмена предпросмотра, возврат к текущему рабочему состоянию."""
+        if self._source is not None:
+            self.preview_ready.emit(self._source.copy())
+
+    def _emit_result(self, result: np.ndarray | None):
+        """Обратная совместимость (для прямых вызовов)."""
+        if result is not None:
+            self.result_ready.emit(result)
+
+    def _pick_color_and_preview(self, btn: QPushButton):
+        """Открывает диалог цвета, обновляет кнопку и запускает предпросмотр."""
+        _pick_color(btn, self)
+        self._schedule_preview()
 
 
 # ===========================================================================
@@ -246,6 +296,7 @@ class BWConversionPanel(_BasePanel):
             if val == 'G':
                 rb.setChecked(True)
             self._ch_group.addButton(rb, i)
+            rb.toggled.connect(self._schedule_preview)   # → живой предпросмотр
             layout.addWidget(rb)
         return w
 
@@ -268,7 +319,8 @@ class BWConversionPanel(_BasePanel):
         r_lbl = QLabel('R:'); r_lbl.setFixedWidth(20)
         r_sl = QSlider(Qt.Horizontal); r_sl.setRange(0, 100); r_sl.setValue(21)
         r_val = QLabel('0.21'); r_val.setObjectName('valueLabel'); r_val.setFixedWidth(36)
-        r_sl.valueChanged.connect(lambda v: (r_val.setText(f'{v/100:.2f}'), self._normalize_mixer('R', v)))
+        r_sl.valueChanged.connect(
+            lambda v: (r_val.setText(f'{v/100:.2f}'), self._normalize_mixer('R', v), self._schedule_preview()))
         r_row.addWidget(r_lbl); r_row.addWidget(r_sl); r_row.addWidget(r_val)
         layout.addLayout(r_row)
 
@@ -276,7 +328,8 @@ class BWConversionPanel(_BasePanel):
         g_lbl = QLabel('G:'); g_lbl.setFixedWidth(20)
         g_sl = QSlider(Qt.Horizontal); g_sl.setRange(0, 100); g_sl.setValue(72)
         g_val = QLabel('0.72'); g_val.setObjectName('valueLabel'); g_val.setFixedWidth(36)
-        g_sl.valueChanged.connect(lambda v: (g_val.setText(f'{v/100:.2f}'), self._normalize_mixer('G', v)))
+        g_sl.valueChanged.connect(
+            lambda v: (g_val.setText(f'{v/100:.2f}'), self._normalize_mixer('G', v), self._schedule_preview()))
         g_row.addWidget(g_lbl); g_row.addWidget(g_sl); g_row.addWidget(g_val)
         layout.addLayout(g_row)
 
@@ -284,11 +337,13 @@ class BWConversionPanel(_BasePanel):
         b_lbl = QLabel('B:'); b_lbl.setFixedWidth(20)
         b_sl = QSlider(Qt.Horizontal); b_sl.setRange(0, 100); b_sl.setValue(7)
         b_val = QLabel('0.07'); b_val.setObjectName('valueLabel'); b_val.setFixedWidth(36)
-        b_sl.valueChanged.connect(lambda v: (b_val.setText(f'{v/100:.2f}'), self._normalize_mixer('B', v)))
+        b_sl.valueChanged.connect(
+            lambda v: (b_val.setText(f'{v/100:.2f}'), self._normalize_mixer('B', v), self._schedule_preview()))
         b_row.addWidget(b_lbl); b_row.addWidget(b_sl); b_row.addWidget(b_val)
         layout.addLayout(b_row)
 
-        preset_combo.currentIndexChanged.connect(lambda i: self._apply_preset(preset_combo, r_sl, g_sl, b_sl))
+        preset_combo.currentIndexChanged.connect(
+            lambda i: self._apply_preset(preset_combo, r_sl, g_sl, b_sl))
 
         return w, r_sl, g_sl, b_sl, r_val, g_val, b_val, preset_combo
 
@@ -305,6 +360,7 @@ class BWConversionPanel(_BasePanel):
             self._r_lbl.setText(f'{wr:.2f}')
             self._g_lbl.setText(f'{wg:.2f}')
             self._b_lbl.setText(f'{wb:.2f}')
+            self._schedule_preview()   # → предпросмотр после применения пресета
 
     def _normalize_mixer(self, changed: str, val: int):
         """Нормализует слайдеры микшера (сумма = 100)."""
@@ -327,9 +383,12 @@ class BWConversionPanel(_BasePanel):
         else:
             self._stack.setCurrentIndex(0)
 
-    def _apply(self):
+        self._schedule_preview()   # → предпросмотр при смене алгоритма
+
+    def _compute(self) -> np.ndarray | None:
+        """Вычисляет Ч/Б конвертацию с текущими настройками."""
         if self._source is None:
-            return
+            return None
         key = self._combo.currentData()
         kwargs = {}
 
@@ -346,12 +405,7 @@ class BWConversionPanel(_BasePanel):
                 wr /= total; wg /= total; wb /= total
             kwargs = {'wr': wr, 'wg': wg, 'wb': wb}
 
-        result = apply_bw(self._source, key, **kwargs)
-        self._emit_result(result)
-
-    def _reset(self):
-        if self._source is not None:
-            self._emit_result(self._source.copy())
+        return apply_bw(self._source, key, **kwargs)
 
 
 # ===========================================================================
@@ -401,6 +455,8 @@ class SepiaPanel(_BasePanel):
         hue_row, self._hue_sl = _slider_row(p1, 'Тон (°):', 10, 60, 35)
         sat_row, self._sat_sl = _slider_row(p1, 'Насыщенность %:', 5, 60, 28)
         pl1.addLayout(hue_row); pl1.addLayout(sat_row)
+        self._hue_sl.valueChanged.connect(self._schedule_preview)
+        self._sat_sl.valueChanged.connect(self._schedule_preview)
         self._stack.addWidget(p1)
 
         # 2: YUV
@@ -408,6 +464,8 @@ class SepiaPanel(_BasePanel):
         u_row, self._u_sl = _slider_row(p2, 'U (Cb) offset:', -60, 60, -18)
         v_row, self._v_sl = _slider_row(p2, 'V (Cr) offset:', -60, 60, 28)
         pl2.addLayout(u_row); pl2.addLayout(v_row)
+        self._u_sl.valueChanged.connect(self._schedule_preview)
+        self._v_sl.valueChanged.connect(self._schedule_preview)
         self._stack.addWidget(p2)
 
         # 3: Gradient Map
@@ -427,9 +485,12 @@ class SepiaPanel(_BasePanel):
         self._highlight_btn = _color_button(p3, (240, 220, 195))
         hl_row.addWidget(self._highlight_btn); hl_row.addStretch()
         pl3.addLayout(hl_row)
-        self._shadow_btn.clicked.connect(lambda: _pick_color(self._shadow_btn, self))
-        self._midtone_btn.clicked.connect(lambda: _pick_color(self._midtone_btn, self))
-        self._highlight_btn.clicked.connect(lambda: _pick_color(self._highlight_btn, self))
+        self._shadow_btn.clicked.connect(
+            lambda: self._pick_color_and_preview(self._shadow_btn))
+        self._midtone_btn.clicked.connect(
+            lambda: self._pick_color_and_preview(self._midtone_btn))
+        self._highlight_btn.clicked.connect(
+            lambda: self._pick_color_and_preview(self._highlight_btn))
         self._stack.addWidget(p3)
 
         # 4: Duotone
@@ -440,8 +501,10 @@ class SepiaPanel(_BasePanel):
         pl4.addWidget(QLabel('Цвет светов (светлый):'))
         c2r = QHBoxLayout(); self._duo_c2_btn = _color_button(p4, (200, 155, 95))
         c2r.addWidget(self._duo_c2_btn); c2r.addStretch(); pl4.addLayout(c2r)
-        self._duo_c1_btn.clicked.connect(lambda: _pick_color(self._duo_c1_btn, self))
-        self._duo_c2_btn.clicked.connect(lambda: _pick_color(self._duo_c2_btn, self))
+        self._duo_c1_btn.clicked.connect(
+            lambda: self._pick_color_and_preview(self._duo_c1_btn))
+        self._duo_c2_btn.clicked.connect(
+            lambda: self._pick_color_and_preview(self._duo_c2_btn))
         self._stack.addWidget(p4)
 
         # 5: Curves
@@ -450,6 +513,9 @@ class SepiaPanel(_BasePanel):
         bs_row, self._bs_sl = _slider_row(p5, 'Тени (синий):', -60, 0, -30)
         bm_row, self._bm_sl = _slider_row(p5, 'Средние (синий):', -40, 0, -15)
         pl5.addLayout(rb_row); pl5.addLayout(bs_row); pl5.addLayout(bm_row)
+        self._rb_sl.valueChanged.connect(self._schedule_preview)
+        self._bs_sl.valueChanged.connect(self._schedule_preview)
+        self._bm_sl.valueChanged.connect(self._schedule_preview)
         self._stack.addWidget(p5)
 
         layout.addWidget(_hline())
@@ -477,10 +543,12 @@ class SepiaPanel(_BasePanel):
         key = self._combo.currentData()
         self._desc_lbl.setText(get_sepia_description(key))
         self._stack.setCurrentIndex(self._PAGE.get(key, 0))
+        self._schedule_preview()   # → предпросмотр при смене метода
 
-    def _apply(self):
+    def _compute(self) -> np.ndarray | None:
+        """Вычисляет тонирование в сепию с текущими настройками."""
         if self._source is None:
-            return
+            return None
         key = self._combo.currentData()
         kwargs = {}
         if key == 'hsl':
@@ -500,12 +568,7 @@ class SepiaPanel(_BasePanel):
             kwargs = {'red_boost': float(self._rb_sl.value()),
                       'blue_shadow_drop': float(self._bs_sl.value()),
                       'blue_mid_drop': float(self._bm_sl.value())}
-        result = apply_sepia(self._source, key, **kwargs)
-        self._emit_result(result)
-
-    def _reset(self):
-        if self._source is not None:
-            self._emit_result(self._source.copy())
+        return apply_sepia(self._source, key, **kwargs)
 
 
 # ===========================================================================
@@ -516,6 +579,7 @@ class EditingPanel(_BasePanel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._current_tool: str = ''
         self._setup_ui()
 
     def _setup_ui(self):
@@ -573,6 +637,9 @@ class EditingPanel(_BasePanel):
         self._pages: dict[str, int] = {}
         self._add_pages()
 
+        # Подключаем все регуляторы к предпросмотру
+        self._connect_editing_controls()
+
         main_layout.addWidget(_hline())
 
         btn_row = QHBoxLayout()
@@ -588,7 +655,6 @@ class EditingPanel(_BasePanel):
 
         self._apply_btn.clicked.connect(self._apply)
         self._reset_btn.clicked.connect(self._reset)
-        self._current_tool: str = ''
 
     def _add_pages(self):
         def _add(key, widget):
@@ -704,8 +770,10 @@ class EditingPanel(_BasePanel):
         sh_row, self._st_hs_sl = _slider_row(p, 'Света x100:', 0, 100, 30)
         sb_row, self._st_b_sl  = _slider_row(p, 'Баланс:', -10, 10, 0)
         l.addLayout(ss_row); l.addLayout(sh_row); l.addLayout(sb_row)
-        self._st_shadow_btn.clicked.connect(lambda: _pick_color(self._st_shadow_btn, self))
-        self._st_hi_btn.clicked.connect(lambda: _pick_color(self._st_hi_btn, self))
+        self._st_shadow_btn.clicked.connect(
+            lambda: self._pick_color_and_preview(self._st_shadow_btn))
+        self._st_hi_btn.clicked.connect(
+            lambda: self._pick_color_and_preview(self._st_hi_btn))
         _add('split_toning', p)
 
         # --- Поворот ---
@@ -736,6 +804,37 @@ class EditingPanel(_BasePanel):
         self._stack.addWidget(QWidget())
         self._stack.setCurrentIndex(self._stack.count() - 1)
 
+    def _connect_editing_controls(self):
+        """Подключает все слайдеры, флажки и радиокнопки к предпросмотру."""
+        # Простые слайдеры
+        for sl in [
+            self._bright_sl, self._contr_sl,
+            self._blk_in_sl, self._wht_in_sl, self._gamma_sl,
+            self._blk_out_sl, self._wht_out_sl,
+            self._clahe_clip_sl, self._clahe_tile_sl,
+            self._usm_r_sl, self._usm_a_sl, self._usm_t_sl,
+            self._lc_r_sl, self._lc_s_sl,
+            self._nl_sl,
+            self._bil_d_sl, self._bil_c_sl, self._bil_sp_sl,
+            self._gauss_sl, self._med_sl,
+            self._vig_s_sl, self._vig_r_sl, self._vig_f_sl,
+            self._grain_i_sl, self._grain_s_sl,
+            self._st_ss_sl, self._st_hs_sl, self._st_b_sl,
+            self._rot_sl,
+        ]:
+            sl.valueChanged.connect(self._schedule_preview)
+
+        # Слайдеры кривых
+        for sl, _ in self._curve_sls:
+            sl.valueChanged.connect(self._schedule_preview)
+
+        # Флажок «Расширить холст»
+        self._rot_expand.stateChanged.connect(self._schedule_preview)
+
+        # Радиокнопки отражения
+        for btn in self._flip_grp.buttons():
+            btn.toggled.connect(self._schedule_preview)
+
     def _on_tool_btn(self):
         btn = self.sender()
         key = btn.property('tool_key')
@@ -748,19 +847,22 @@ class EditingPanel(_BasePanel):
         if key in self._pages:
             self._stack.setCurrentIndex(self._pages[key])
 
-    def _apply(self):
+        self._schedule_preview()   # → предпросмотр при выборе инструмента
+
+    def _compute(self) -> np.ndarray | None:
+        """Вычисляет результат текущего инструмента редактирования."""
         if self._source is None or not self._current_tool:
-            return
+            return None
         key = self._current_tool
 
         try:
             if key == 'brightness_contrast':
-                result = adjust_brightness_contrast(
+                return adjust_brightness_contrast(
                     self._source,
                     brightness=self._bright_sl.value(),
                     contrast=self._contr_sl.value())
             elif key == 'levels':
-                result = adjust_levels(
+                return adjust_levels(
                     self._source,
                     black_in=self._blk_in_sl.value(),
                     white_in=self._wht_in_sl.value(),
@@ -771,68 +873,63 @@ class EditingPanel(_BasePanel):
                 inputs = [0, 64, 128, 192, 255]
                 pts = [(inputs[i], self._curve_sls[i][0].value())
                        for i in range(5)]
-                result = adjust_curves(self._source, pts)
+                return adjust_curves(self._source, pts)
             elif key == 'histogram_eq':
-                result = histogram_equalization(self._source)
+                return histogram_equalization(self._source)
             elif key == 'clahe':
-                result = clahe(self._source,
-                               clip_limit=self._clahe_clip_sl.value() / 10.0,
-                               tile_size=self._clahe_tile_sl.value())
+                return clahe(self._source,
+                             clip_limit=self._clahe_clip_sl.value() / 10.0,
+                             tile_size=self._clahe_tile_sl.value())
             elif key == 'unsharp_mask':
-                result = unsharp_mask(self._source,
-                                      radius=self._usm_r_sl.value() / 10.0,
-                                      amount=self._usm_a_sl.value() / 10.0,
-                                      threshold=self._usm_t_sl.value())
+                return unsharp_mask(self._source,
+                                    radius=self._usm_r_sl.value() / 10.0,
+                                    amount=self._usm_a_sl.value() / 10.0,
+                                    threshold=self._usm_t_sl.value())
             elif key == 'local_contrast':
-                result = local_contrast(self._source,
-                                        radius=self._lc_r_sl.value(),
-                                        strength=self._lc_s_sl.value() / 10.0)
+                return local_contrast(self._source,
+                                      radius=self._lc_r_sl.value(),
+                                      strength=self._lc_s_sl.value() / 10.0)
             elif key == 'denoise_nlmeans':
-                result = denoise_nlmeans(self._source, strength=self._nl_sl.value())
+                return denoise_nlmeans(self._source, strength=self._nl_sl.value())
             elif key == 'denoise_bilateral':
-                result = denoise_bilateral(self._source,
-                                           diameter=self._bil_d_sl.value(),
-                                           sigma_color=float(self._bil_c_sl.value()),
-                                           sigma_space=float(self._bil_sp_sl.value()))
+                return denoise_bilateral(self._source,
+                                         diameter=self._bil_d_sl.value(),
+                                         sigma_color=float(self._bil_c_sl.value()),
+                                         sigma_space=float(self._bil_sp_sl.value()))
             elif key == 'denoise_gaussian':
-                result = denoise_gaussian(self._source, strength=self._gauss_sl.value() / 10.0)
+                return denoise_gaussian(self._source,
+                                        strength=self._gauss_sl.value() / 10.0)
             elif key == 'denoise_median':
-                result = denoise_median(self._source, kernel_size=self._med_sl.value())
+                return denoise_median(self._source,
+                                      kernel_size=self._med_sl.value())
             elif key == 'vignette':
-                result = add_vignette(self._source,
-                                      strength=self._vig_s_sl.value() / 100.0,
-                                      radius=self._vig_r_sl.value() / 100.0,
-                                      feather=self._vig_f_sl.value() / 10.0)
+                return add_vignette(self._source,
+                                    strength=self._vig_s_sl.value() / 100.0,
+                                    radius=self._vig_r_sl.value() / 100.0,
+                                    feather=self._vig_f_sl.value() / 10.0)
             elif key == 'film_grain':
-                result = add_film_grain(self._source,
-                                        intensity=float(self._grain_i_sl.value()),
-                                        scale=self._grain_s_sl.value() / 10.0)
+                return add_film_grain(self._source,
+                                      intensity=float(self._grain_i_sl.value()),
+                                      scale=self._grain_s_sl.value() / 10.0)
             elif key == 'split_toning':
-                result = split_toning(self._source,
-                                      shadow_rgb=self._st_shadow_btn._color,
-                                      highlight_rgb=self._st_hi_btn._color,
-                                      shadow_strength=self._st_ss_sl.value() / 100.0,
-                                      highlight_strength=self._st_hs_sl.value() / 100.0,
-                                      balance=self._st_b_sl.value() / 10.0)
+                return split_toning(self._source,
+                                    shadow_rgb=self._st_shadow_btn._color,
+                                    highlight_rgb=self._st_hi_btn._color,
+                                    shadow_strength=self._st_ss_sl.value() / 100.0,
+                                    highlight_strength=self._st_hs_sl.value() / 100.0,
+                                    balance=self._st_b_sl.value() / 10.0)
             elif key == 'rotate':
-                result = rotate_image(self._source,
-                                      angle=float(self._rot_sl.value()),
-                                      expand=self._rot_expand.isChecked())
+                return rotate_image(self._source,
+                                    angle=float(self._rot_sl.value()),
+                                    expand=self._rot_expand.isChecked())
             elif key == 'flip':
                 btn = self._flip_grp.checkedButton()
                 direction = btn.property('flip_dir') if btn else 'horizontal'
-                result = flip_image(self._source, direction=direction)
-            else:
-                return
+                return flip_image(self._source, direction=direction)
         except Exception as e:
             print(f'Ошибка применения инструмента {key}: {e}')
-            return
 
-        self._emit_result(result)
-
-    def _reset(self):
-        if self._source is not None:
-            self._emit_result(self._source.copy())
+        return None
 
 
 # ===========================================================================
@@ -910,6 +1007,9 @@ class InfraredPanel(_BasePanel):
 
         self._pages: dict[str, int] = {}
         self._add_ir_pages()
+
+        # Подключаем все ИК-регуляторы к предпросмотру
+        self._connect_ir_controls()
 
         layout.addWidget(_hline())
 
@@ -1004,6 +1104,20 @@ class InfraredPanel(_BasePanel):
         self._stack.addWidget(QWidget())
         self._stack.setCurrentIndex(self._stack.count() - 1)
 
+    def _connect_ir_controls(self):
+        """Подключает все ИК-слайдеры к предпросмотру."""
+        for sl in [
+            self._ir_r_sl, self._ir_g_sl, self._ir_b_sl,
+            self._ir720_c_sl,
+            self._wood_b_sl,
+            self._hc_bp_sl, self._hc_wp_sl,
+            self._glow_s_sl, self._glow_r_sl, self._glow_t_sl,
+            self._bb_s_sl,
+            self._warm_sl,
+            self._cool_sl,
+        ]:
+            sl.valueChanged.connect(self._schedule_preview)
+
     def _on_method_changed(self):
         key = self._combo.currentData()
         if not key or key == '__sep__':
@@ -1011,13 +1125,15 @@ class InfraredPanel(_BasePanel):
         self._desc_lbl.setText(get_ir_description(key))
         if key in self._pages:
             self._stack.setCurrentIndex(self._pages[key])
+        self._schedule_preview()   # → предпросмотр при смене метода
 
-    def _apply(self):
+    def _compute(self) -> np.ndarray | None:
+        """Вычисляет ИК-обработку с текущими настройками."""
         if self._source is None:
-            return
+            return None
         key = self._combo.currentData()
         if not key or key == '__sep__':
-            return
+            return None
         kwargs = {}
 
         if key == 'channel_mixer':
@@ -1047,11 +1163,7 @@ class InfraredPanel(_BasePanel):
             kwargs = {'coolness': self._cool_sl.value() / 100.0}
 
         try:
-            result = apply_ir(self._source, key, **kwargs)
-            self._emit_result(result)
+            return apply_ir(self._source, key, **kwargs)
         except Exception as e:
             print(f'Ошибка ИК-обработки: {e}')
-
-    def _reset(self):
-        if self._source is not None:
-            self._emit_result(self._source.copy())
+            return None
